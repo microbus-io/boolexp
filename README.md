@@ -9,7 +9,7 @@ Syntax:
 - Parentheses `(` and `)`
 - Constants `true` and `false`
 - Dot notation `symbol.property`
-- Quotation of string literals using `'` or `"`
+- Quotation of string literals using `'`, `"` or `` ` ``
 
 Evaluate against a `map[string]any`:
 

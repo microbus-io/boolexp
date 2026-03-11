@@ -304,6 +304,10 @@ func TestSyntax(t *testing.T) {
 		"a & b",
 		"a | b",
 		"a || b.",
+		"valid ==",
+		"== ==",
+		"a > > b",
+		"a =~ '[invalid",
 	}
 	for _, tc := range tcErr {
 		_, err := Eval(tc, nil)

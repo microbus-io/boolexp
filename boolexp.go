@@ -37,6 +37,12 @@ func Eval(boolExp string, symbols any) (bool, error) {
 	return b, errors.Trace(err)
 }
 
+// Validate validates that a boolean expression is syntactically correct.
+func Validate(boolExp string) (err error) {
+	_, err = evaluateBoolExp(boolExp, nil)
+	return errors.Trace(err)
+}
+
 // flattenSymbolsMap flattens the symbols map into a shallow dot-notated map,
 // while normalizing all arrays to []any and all maps to map[string]any.
 func flattenSymbolsMap(symbols any) map[string]any {
@@ -169,6 +175,12 @@ func evaluateBoolExp(boolExp string, flattenedSymbols map[string]any) (bool, err
 		}
 	}
 	if operator != "" {
+		if err := validateOperand(before); err != nil {
+			return false, errors.Trace(err)
+		}
+		if err := validateOperand(after); err != nil {
+			return false, errors.Trace(err)
+		}
 		x := evalValue(before, flattenedSymbols)
 		y := evalValue(after, flattenedSymbols)
 		switch operator {
@@ -238,6 +250,35 @@ func evaluateBoolExp(boolExp string, flattenedSymbols map[string]any) (bool, err
 		return !b, nil
 	}
 	return b, nil
+}
+
+// validateOperand checks that a binary operator operand is syntactically valid:
+// an identifier, a quoted string, a number, or a boolean.
+func validateOperand(v string) error {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return errors.New("empty operand")
+	}
+	// Quoted string - must have matching closing quote
+	if v[0] == '\'' || v[0] == '"' || v[0] == '`' {
+		if len(v) < 2 || v[len(v)-1] != v[0] {
+			return errors.New("unterminated string '%s'", v)
+		}
+		return nil
+	}
+	// Number
+	if _, err := strconv.ParseFloat(v, 64); err == nil {
+		return nil
+	}
+	// Boolean
+	if _, err := strconv.ParseBool(v); err == nil {
+		return nil
+	}
+	// Identifier (e.g. foo, foo.bar)
+	if identifierRegexp.MatchString(v) {
+		return nil
+	}
+	return errors.New("invalid operand '%s'", v)
 }
 
 // sameType returns true if x and y are of the same type.
