@@ -5,7 +5,7 @@ go 1.24.3
 tool github.com/microbus-io/copyrighter
 
 require (
-	github.com/microbus-io/errors v1.0.0
+	github.com/microbus-io/errors v1.0.1
 	github.com/microbus-io/testarossa v0.7.3
 )
 
