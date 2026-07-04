@@ -17,7 +17,9 @@ limitations under the License.
 package boolexp
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/microbus-io/testarossa"
 )
@@ -308,6 +310,14 @@ func TestSyntax(t *testing.T) {
 		"== ==",
 		"a > > b",
 		"a =~ '[invalid",
+		// Close paren before its matching open: previously infinite-looped the paren-resolution
+		// pass (depth nets back to 0 so the end-of-scan guard missed it). Now rejected.
+		")(",
+		")()(",
+		"a)(b",
+		"))((",
+		"a && )(",
+		")( || true",
 	}
 	for _, tc := range tcErr {
 		_, err := Eval(tc, nil)
@@ -356,4 +366,40 @@ func TestSymbols(t *testing.T) {
 	l := 9999
 	v, err = Eval("i==5 && s=='hello' && obj.field=~'^[a-z0-9]+$'", l)
 	assert.Expect(err, nil, v, false)
+}
+
+// FuzzTerminates asserts Validate and Eval always RETURN on arbitrary input — they must never hang.
+// It guards termination directly (the property), rather than pre-validating syntax (which would have
+// to re-implement the parser's quote-aware paren tracking and could diverge from it). A malformed
+// expression must come back as an error, never as an infinite loop: boolexp evaluates author-supplied
+// `when` expressions on a caller's hot path, so a hang wedges the calling goroutine permanently.
+//
+// Regression seed: ")(" (a close paren before its matching open) once span-looped the paren pass
+// forever; the parenDepth<0 guard now rejects it. The watchdog turns any future hang class into a
+// bounded test failure instead of a hung suite.
+func FuzzTerminates(f *testing.F) {
+	seeds := []string{
+		")(", ")()(", "a)(b", "))((", "a && )(", ")( || true",
+		"", "(", ")", "((((((((((", "true", "false",
+		`x == "())("`, `a =~ '('`, "(a || b) && (c)", "!!!(true)",
+		"a && (b || (c && (d)))", "\t\n)(", "a" + strings.Repeat("(", 64),
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, expr string) {
+		symbols := map[string]any{"a": 1, "b": "x", "c": true}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			// Return values are irrelevant; the assertion is that these calls return AT ALL.
+			_ = Validate(expr)
+			_, _ = Eval(expr, symbols)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("boolexp did not terminate on %q", expr)
+		}
+	})
 }
