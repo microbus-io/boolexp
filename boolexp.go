@@ -108,6 +108,12 @@ func evaluateBoolExp(boolExp string, flattenedSymbols map[string]any) (bool, err
 				}
 			} else if boolExp[i] == ')' {
 				parenDepth--
+				if parenDepth < 0 {
+					// A close paren before any matching open. Without this, the depth nets back to 0
+					// via a later '(' so the end-of-scan guard misses it, parenStart stays set, and the
+					// outer loop re-runs on the unchanged string forever (e.g. ")(").
+					return false, errors.New("invalid parenthesis pattern")
+				}
 				if parenDepth == 0 {
 					subEval, err := evaluateBoolExp(boolExp[parenStart+1:i], flattenedSymbols)
 					if err != nil {
