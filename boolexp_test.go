@@ -41,10 +41,14 @@ func TestFlattenSymbolsMap(t *testing.T) {
 			"z": "3",
 		}),
 	)
-	// Array
+	// Array.
+	// An integer normalizes to an int64 and a fractional number to a float64. JSON has one number
+	// type, so the classification follows the LITERAL, not the Go type it was written from: float32(1.0)
+	// marshals to "1" and comes back an int64. That is invisible to an expression - all numbers compare
+	// as one type - and is what keeps a 64-bit id exact.
 	assert.Equal(
 		map[string]any{
-			"arr_int":        []any{1.0, 2.0, 3.0},
+			"arr_int":        []any{int64(1), int64(2), int64(3)},
 			"arr_int.1":      true,
 			"arr_int.2":      true,
 			"arr_int.3":      true,
@@ -52,7 +56,7 @@ func TestFlattenSymbolsMap(t *testing.T) {
 			"arr_string.x":   true,
 			"arr_string.y":   true,
 			"arr_string.z":   true,
-			"arr_float":      []any{1.0, 2.5, 3.33},
+			"arr_float":      []any{int64(1), 2.5, 3.33},
 			"arr_float.1":    true,
 			"arr_float.2.5":  true,
 			"arr_float.3.33": true,
@@ -67,11 +71,11 @@ func TestFlattenSymbolsMap(t *testing.T) {
 	assert.Equal(
 		map[string]any{
 			"map_int": map[string]any{
-				"a": 1.0, "b": 2.0, "c": 3.0,
+				"a": int64(1), "b": int64(2), "c": int64(3),
 			},
-			"map_int.a": 1.0,
-			"map_int.b": 2.0,
-			"map_int.c": 3.0,
+			"map_int.a": int64(1),
+			"map_int.b": int64(2),
+			"map_int.c": int64(3),
 			"map_string": map[string]any{
 				"a": "A", "b": "B", "c": "C",
 			},
@@ -79,9 +83,9 @@ func TestFlattenSymbolsMap(t *testing.T) {
 			"map_string.b": "B",
 			"map_string.c": "C",
 			"map_float": map[string]any{
-				"a": 1.0, "b": 2.5, "c": 3.33,
+				"a": int64(1), "b": 2.5, "c": 3.33,
 			},
-			"map_float.a": 1.0,
+			"map_float.a": int64(1),
 			"map_float.b": 2.5,
 			"map_float.c": 3.33,
 		},
@@ -402,4 +406,65 @@ func FuzzTerminates(f *testing.F) {
 			t.Fatalf("boolexp did not terminate on %q", expr)
 		}
 	})
+}
+
+// Numbers are compared exactly, not through a float64 - which holds integers only up to 2^53, so
+// neighboring 64-bit identifiers collapse onto the same value and two DIFFERENT ids compare equal.
+// Integers and fractional numbers still compare as one type, so an expression need not know how a
+// number happened to be spelled.
+func TestNumericPrecision(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// Two distinct Snowflake-scale ids, 1 apart: the same float64 rounds both to ...768.
+	const id = 1234567890123456789
+	const neighbor = 1234567890123456788
+	assert.Equal(float64(id), float64(neighbor)) // the trap, stated outright
+
+	symbols := map[string]any{"id": int64(id), "other": int64(neighbor)}
+
+	// Symbol vs literal: the literal side is parsed exactly too, or the comparison rounds there instead.
+	v, err := Eval("id==1234567890123456789", symbols)
+	assert.Expect(err, nil, v, true)
+	v, err = Eval("id==1234567890123456788", symbols)
+	assert.Expect(err, nil, v, false)
+
+	// Symbol vs symbol.
+	v, err = Eval("id==other", symbols)
+	assert.Expect(err, nil, v, false)
+	v, err = Eval("id>other", symbols)
+	assert.Expect(err, nil, v, true)
+
+	// Ordering is exact at full width, not at float64 resolution.
+	v, err = Eval("id>1234567890123456788 && id<1234567890123456790", symbols)
+	assert.Expect(err, nil, v, true)
+}
+
+// An integer symbol and a fractional literal (and vice versa) are one number domain: a comparison must
+// not gate on whether the value arrived as an int64 or a float64.
+func TestMixedIntAndFloatComparison(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	symbols := map[string]any{
+		"qty":   3,    // int -> int64
+		"score": 88.5, // float64
+		"zero":  0,    // int64 zero, for the existence/empty path
+		"ratio": 2.0,  // marshals to "2" -> int64: JSON has one number type
+	}
+
+	for _, exp := range []string{
+		"qty==3", "qty>2.5", "qty<3.5", "qty>=3.0", "qty<=3",
+		"score>88", "score<89", "score>=88.5", "score!=88",
+		"ratio==2", "ratio==2.0", "ratio>1.5",
+		"qty", "!zero", // existence: a non-zero number is truthy, a zero one is not
+	} {
+		v, err := Eval(exp, symbols)
+		assert.NoError(err, "%s", exp)
+		assert.True(v, "expected %s to evaluate true", exp)
+	}
+
+	// A number and a non-number are still different types.
+	v, err := Eval("qty=='3'", symbols)
+	assert.Expect(err, nil, v, false)
 }

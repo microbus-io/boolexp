@@ -17,6 +17,7 @@ limitations under the License.
 package boolexp
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -46,16 +47,22 @@ func Validate(boolExp string) (err error) {
 // flattenSymbolsMap flattens the symbols map into a shallow dot-notated map,
 // while normalizing all arrays to []any and all maps to map[string]any.
 func flattenSymbolsMap(symbols any) map[string]any {
-	// Normalize all numbers to float64, all arrays to []any and all maps to map[string]any
+	// Normalize all arrays to []any, all maps to map[string]any, and all numbers to int64 (an integer
+	// literal) or float64 (anything else). The decoder reads numbers exactly (UseNumber) rather than
+	// through the default float64, which holds integers only up to 2^53: a 64-bit identifier decoded as
+	// a float64 collapses onto its neighbors, so two DIFFERENT ids would compare equal.
 	j, err := json.Marshal(symbols)
 	if err != nil {
 		return nil
 	}
+	dec := json.NewDecoder(bytes.NewReader(j))
+	dec.UseNumber()
 	var mappedSymbols map[string]any
-	err = json.Unmarshal(j, &mappedSymbols)
+	err = dec.Decode(&mappedSymbols)
 	if err != nil {
 		return nil
 	}
+	normalizeNumbers(mappedSymbols)
 
 	// Flatten the symbols into a shallow dot-notated map
 	flattenedSymbols := map[string]any{}
@@ -77,6 +84,31 @@ func flattenSymbolsMap(symbols any) map[string]any {
 	}
 	flatten(mappedSymbols, "")
 	return flattenedSymbols
+}
+
+// normalizeNumbers replaces every json.Number in a decoded tree with an int64 (an integer literal that
+// fits) or a float64 (anything else), in place. A number too large for even a float64 is left as a
+// json.Number rather than rounded to infinity; asNumber still reads it.
+func normalizeNumbers(v any) any {
+	switch t := v.(type) {
+	case json.Number:
+		if n, ok := parseNumber(t.String()); ok {
+			if n.isInt {
+				return n.i
+			}
+			return n.f
+		}
+		return t
+	case map[string]any:
+		for k, e := range t {
+			t[k] = normalizeNumbers(e)
+		}
+	case []any:
+		for i, e := range t {
+			t[i] = normalizeNumbers(e)
+		}
+	}
+	return v
 }
 
 // evaluateBoolExp evaluates the boolean expressing, assuming that the input symbols have been flattened and normalized.
@@ -287,8 +319,79 @@ func validateOperand(v string) error {
 	return errors.New("invalid operand '%s'", v)
 }
 
-// sameType returns true if x and y are of the same type.
+// num is a numeric operand carried without precision loss: an integer keeps its exact int64 value, and
+// everything else is a float64. Two integers are compared as integers, so identifiers beyond 2^53 (a
+// 64-bit database key, a Snowflake id) compare exactly rather than through a float64 that rounds
+// neighboring values onto each other. A comparison mixing an integer and a fractional number falls back
+// to float64 - the widest common ground, and the only one that can express both.
+type num struct {
+	i     int64
+	f     float64
+	isInt bool
+}
+
+// asNumber reports whether x is a number, and reads it exactly.
+func asNumber(x any) (num, bool) {
+	switch v := x.(type) {
+	case int64:
+		return num{i: v, isInt: true}, true
+	case float64:
+		return num{f: v}, true
+	case json.Number: // beyond float64's range, so normalizeNumbers kept the literal
+		return parseNumber(v.String())
+	default:
+		return num{}, false
+	}
+}
+
+// parseNumber reads a numeric literal, preferring an exact integer.
+func parseNumber(s string) (num, bool) {
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return num{i: i, isInt: true}, true
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return num{f: f}, true
+	}
+	return num{}, false
+}
+
+func (n num) float() float64 {
+	if n.isInt {
+		return float64(n.i)
+	}
+	return n.f
+}
+
+func (n num) eq(m num) bool {
+	if n.isInt && m.isInt {
+		return n.i == m.i
+	}
+	return n.float() == m.float()
+}
+
+func (n num) lt(m num) bool {
+	if n.isInt && m.isInt {
+		return n.i < m.i
+	}
+	return n.float() < m.float()
+}
+
+func (n num) zero() bool {
+	if n.isInt {
+		return n.i == 0
+	}
+	return n.f == 0
+}
+
+// sameType returns true if x and y are of the same type. All numbers are ONE type here: an integer
+// symbol and a fractional literal (or vice versa) are comparable, so `qty >= 1.5` works whether qty
+// arrived as an int64 or a float64. Without this, every comparison gates on how the number happened to
+// be spelled.
 func sameType(x any, y any) bool {
+	if _, ok := asNumber(x); ok {
+		_, ok := asNumber(y)
+		return ok
+	}
 	return reflect.TypeOf(x) == reflect.TypeOf(y)
 }
 
@@ -297,11 +400,12 @@ func empty(x any) bool {
 	if isNil(x) {
 		return true
 	}
+	if n, ok := asNumber(x); ok {
+		return n.zero()
+	}
 	switch v := x.(type) {
 	case string:
 		return v == ""
-	case float64:
-		return v == 0
 	case bool:
 		return !v
 	default:
@@ -311,6 +415,10 @@ func empty(x any) bool {
 
 // eq returns true if x and y are of the same type and x==y.
 func eq(x any, y any) bool {
+	if nx, ok := asNumber(x); ok {
+		ny, ok := asNumber(y)
+		return ok && nx.eq(ny)
+	}
 	if reflect.TypeOf(x) != reflect.TypeOf(y) {
 		return false
 	}
@@ -320,8 +428,6 @@ func eq(x any, y any) bool {
 	switch v := x.(type) {
 	case string:
 		return v == y.(string)
-	case float64:
-		return v == y.(float64)
 	case bool:
 		return v == y.(bool)
 	default:
@@ -331,14 +437,16 @@ func eq(x any, y any) bool {
 
 // lt returns true if x and y are of the same type and x<y.
 func lt(x any, y any) bool {
+	if nx, ok := asNumber(x); ok {
+		ny, ok := asNumber(y)
+		return ok && nx.lt(ny)
+	}
 	if reflect.TypeOf(x) != reflect.TypeOf(y) {
 		return false
 	}
 	switch v := x.(type) {
 	case string:
 		return v < y.(string)
-	case float64:
-		return v < y.(float64)
 	default:
 		return false
 	}
@@ -364,9 +472,13 @@ func evalValue(v string, symbols map[string]any) any {
 	if strings.HasPrefix(v, "`") && strings.HasSuffix(v, "`") && len(v) >= 2 {
 		return v[1 : len(v)-1]
 	}
-	// Number
-	if f, err := strconv.ParseFloat(v, 64); err == nil {
-		return f
+	// Number. An integer literal is read exactly (int64), not through a float64 - otherwise the literal
+	// side of `id == 1234567890123456789` rounds, and the expression matches a DIFFERENT id.
+	if n, ok := parseNumber(v); ok {
+		if n.isInt {
+			return n.i
+		}
+		return n.f
 	}
 	// Boolean
 	if b, err := strconv.ParseBool(v); err == nil {
