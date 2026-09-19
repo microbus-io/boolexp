@@ -17,6 +17,7 @@ limitations under the License.
 package boolexp
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -24,11 +25,55 @@ import (
 	"github.com/microbus-io/testarossa"
 )
 
+// Normalize converts arrays and maps to []any / map[string]any, and numbers to int64 or float64 -
+// following the JSON LITERAL, not the Go type: float32(1.0) marshals to "1" and comes back an int64. That
+// is invisible to an expression - all numbers compare as one type - and is what keeps a 64-bit id exact.
+func TestNormalize(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// No-op: already normalized values pass through unchanged.
+	m := map[string]any{"x": "1", "y": "2", "z": "3"}
+	out, err := Normalize(m)
+	assert.NoError(err)
+	assert.Equal(m, out)
+
+	out, err = Normalize(map[string]any{
+		"arr_int":    []int{1, 2, 3},
+		"arr_string": []string{"x", "y", "z"},
+		"arr_float":  []float32{1.0, 2.5, 3.33},
+		"map_int":    map[string]int{"a": 1, "b": 2, "c": 3},
+		"map_string": map[string]string{"a": "A", "b": "B", "c": "C"},
+		"map_float":  map[string]float32{"a": 1.0, "b": 2.5, "c": 3.33},
+	})
+	assert.NoError(err)
+	assert.Equal(map[string]any{
+		"arr_int":    []any{int64(1), int64(2), int64(3)},
+		"arr_string": []any{"x", "y", "z"},
+		"arr_float":  []any{int64(1), 2.5, 3.33},
+		"map_int":    map[string]any{"a": int64(1), "b": int64(2), "c": int64(3)},
+		"map_string": map[string]any{"a": "A", "b": "B", "c": "C"},
+		"map_float":  map[string]any{"a": int64(1), "b": 2.5, "c": 3.33},
+	}, out)
+}
+
+// Proven by mutation rather than by comparing the return value, since equal-but-copied maps would also
+// satisfy assert.Equal.
+func TestNormalize_NoOpReturnsSameMap(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	m := map[string]any{"a": int64(1)}
+	out, err := Normalize(m)
+	assert.NoError(err)
+	m["b"] = "added later"
+	assert.Equal("added later", out["b"])
+}
+
 func TestFlattenSymbolsMap(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
 
-	// No op
 	assert.Equal(
 		map[string]any{
 			"x": "1",
@@ -41,64 +86,20 @@ func TestFlattenSymbolsMap(t *testing.T) {
 			"z": "3",
 		}),
 	)
-	// Array.
-	// An integer normalizes to an int64 and a fractional number to a float64. JSON has one number
-	// type, so the classification follows the LITERAL, not the Go type it was written from: float32(1.0)
-	// marshals to "1" and comes back an int64. That is invisible to an expression - all numbers compare
-	// as one type - and is what keeps a 64-bit id exact.
+
 	assert.Equal(
 		map[string]any{
-			"arr_int":        []any{int64(1), int64(2), int64(3)},
-			"arr_int.1":      true,
-			"arr_int.2":      true,
-			"arr_int.3":      true,
-			"arr_string":     []any{"x", "y", "z"},
-			"arr_string.x":   true,
-			"arr_string.y":   true,
-			"arr_string.z":   true,
-			"arr_float":      []any{int64(1), 2.5, 3.33},
-			"arr_float.1":    true,
-			"arr_float.2.5":  true,
-			"arr_float.3.33": true,
+			"arr":      []any{"x", "y", "z"},
+			"arr.x":    true,
+			"arr.y":    true,
+			"arr.z":    true,
+			"nested":   map[string]any{"a": int64(1), "b": "B"},
+			"nested.a": int64(1),
+			"nested.b": "B",
 		},
 		flattenSymbolsMap(map[string]any{
-			"arr_int":    []int{1, 2, 3},
-			"arr_string": []string{"x", "y", "z"},
-			"arr_float":  []float32{1.0, 2.5, 3.33},
-		}),
-	)
-	// Map
-	assert.Equal(
-		map[string]any{
-			"map_int": map[string]any{
-				"a": int64(1), "b": int64(2), "c": int64(3),
-			},
-			"map_int.a": int64(1),
-			"map_int.b": int64(2),
-			"map_int.c": int64(3),
-			"map_string": map[string]any{
-				"a": "A", "b": "B", "c": "C",
-			},
-			"map_string.a": "A",
-			"map_string.b": "B",
-			"map_string.c": "C",
-			"map_float": map[string]any{
-				"a": int64(1), "b": 2.5, "c": 3.33,
-			},
-			"map_float.a": int64(1),
-			"map_float.b": 2.5,
-			"map_float.c": 3.33,
-		},
-		flattenSymbolsMap(map[string]any{
-			"map_int": map[string]int{
-				"a": 1, "b": 2, "c": 3,
-			},
-			"map_string": map[string]string{
-				"a": "A", "b": "B", "c": "C",
-			},
-			"map_float": map[string]float32{
-				"a": 1.0, "b": 2.5, "c": 3.33,
-			},
+			"arr":    []any{"x", "y", "z"},
+			"nested": map[string]any{"a": int64(1), "b": "B"},
 		}),
 	)
 }
@@ -366,10 +367,11 @@ func TestSymbols(t *testing.T) {
 	v, err = Eval("(i==5 || i==7) && s=='hello' && nested.field=~'^[a-z0-9]+$'", object)
 	assert.Expect(err, nil, v, true)
 
-	// Literal
+	// Literal - a scalar can't decode into named symbols, so Eval surfaces Normalize's error.
 	l := 9999
 	v, err = Eval("i==5 && s=='hello' && obj.field=~'^[a-z0-9]+$'", l)
-	assert.Expect(err, nil, v, false)
+	assert.Error(err)
+	assert.False(v)
 }
 
 // FuzzTerminates asserts Validate and Eval always RETURN on arbitrary input — they must never hang.
@@ -440,6 +442,116 @@ func TestNumericPrecision(t *testing.T) {
 	assert.Expect(err, nil, v, true)
 }
 
+func TestIsNormalized(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	tcTrue := []any{
+		nil,
+		true,
+		"hello",
+		int64(5),
+		float64(5.5),
+		json.Number("99999999999999999999999999999999"), // beyond even float64's range
+		map[string]any{},
+		[]any{},
+		map[string]any{"a": int64(1), "b": []any{"x", float64(2.5), nil}},
+		[]any{map[string]any{"a": int64(1)}, []any{int64(2)}},
+	}
+	for _, tc := range tcTrue {
+		assert.True(isNormalized(tc), "%#v", tc)
+	}
+
+	tcFalse := []any{
+		5,
+		int32(5),
+		float32(5),
+		uint(5),
+		[]int{1, 2},
+		map[string]int{"a": 1},
+		struct{ A int }{A: 1},
+		map[string]any{"a": 5},
+		map[string]any{"a": []any{"x", 5}},
+		[]any{map[string]any{"a": 5}},
+		map[string]any{"a": map[string]any{"b": 5}},
+	}
+	for _, tc := range tcFalse {
+		assert.False(isNormalized(tc), "%#v", tc)
+	}
+}
+
+// The fast and slow paths must produce identical results.
+func TestNormalize_FastPathMatchesSlowPath(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	normalized := map[string]any{
+		"str":    "hello",
+		"num":    int64(5),
+		"frac":   2.5,
+		"nested": map[string]any{"a": int64(1), "b": "B"},
+		"arr":    []any{"x", int64(2)},
+	}
+	raw := map[string]any{
+		"str":    "hello",
+		"num":    5,
+		"frac":   2.5,
+		"nested": map[string]int{"a": 1, "b": 2}, // "b" differs from normalized's, proving this took its own round trip
+		"arr":    []any{"x", 2},
+	}
+
+	assert.True(isNormalized(normalized))
+	assert.False(isNormalized(raw))
+
+	fast, err := Normalize(normalized)
+	assert.NoError(err)
+	slow, err := Normalize(raw)
+	assert.NoError(err)
+
+	assert.Equal(normalized, fast) // no-op
+
+	assert.Equal(map[string]any{
+		"str":    "hello",
+		"num":    int64(5),
+		"frac":   2.5,
+		"nested": map[string]any{"a": int64(1), "b": int64(2)},
+		"arr":    []any{"x", int64(2)},
+	}, slow)
+}
+
+// The documented usage pattern: Normalize once, then Eval repeatedly against the result.
+func TestEval_PreDecodedMapReused(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	const id = 1234567890123456789
+	type obj struct {
+		ID     int64    `json:"id"`
+		Name   string   `json:"name"`
+		Active bool     `json:"active"`
+		Tags   []string `json:"tags"`
+	}
+	decoded, err := Normalize(obj{ID: id, Name: "widget", Active: true, Tags: []string{"a", "b"}})
+	assert.NoError(err)
+	assert.True(isNormalized(decoded))
+
+	for _, tc := range []struct {
+		expr string
+		want bool
+	}{
+		{"id==1234567890123456789", true},
+		{"id==1234567890123456788", false},
+		{"name=='widget'", true},
+		{"active", true},
+		{"tags.a", true},
+		{"tags.c", false},
+	} {
+		v, err := Eval(tc.expr, decoded)
+		assert.NoError(err, tc.expr)
+		assert.Equal(tc.want, v, tc.expr)
+	}
+}
+
 // An integer symbol and a fractional literal (and vice versa) are one number domain: a comparison must
 // not gate on whether the value arrived as an int64 or a float64.
 func TestMixedIntAndFloatComparison(t *testing.T) {
@@ -467,4 +579,44 @@ func TestMixedIntAndFloatComparison(t *testing.T) {
 	// A number and a non-number are still different types.
 	v, err := Eval("qty=='3'", symbols)
 	assert.Expect(err, nil, v, false)
+}
+
+// Compares an already-normalized map (fast path) against the equivalent struct (forces the round trip).
+func BenchmarkEval_PreNormalizedMap(b *testing.B) {
+	symbols := map[string]any{
+		"id":     int64(1234567890123456789),
+		"name":   "widget",
+		"active": true,
+		"nested": map[string]any{"a": int64(1), "b": "B"},
+		"tags":   []any{"a", "b", "c"},
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = Eval("id==1234567890123456789 && name=='widget' && active && nested.a==1 && tags.b", symbols)
+	}
+}
+
+func BenchmarkEval_Struct(b *testing.B) {
+	type nested struct {
+		A int    `json:"a"`
+		B string `json:"b"`
+	}
+	type obj struct {
+		ID     int64    `json:"id"`
+		Name   string   `json:"name"`
+		Active bool     `json:"active"`
+		Nested nested   `json:"nested"`
+		Tags   []string `json:"tags"`
+	}
+	symbols := obj{
+		ID:     1234567890123456789,
+		Name:   "widget",
+		Active: true,
+		Nested: nested{A: 1, B: "B"},
+		Tags:   []string{"a", "b", "c"},
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = Eval("id==1234567890123456789 && name=='widget' && active && nested.a==1 && tags.b", symbols)
+	}
 }

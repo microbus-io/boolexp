@@ -34,7 +34,11 @@ var (
 
 // Eval evaluates a boolean expression against a set of key-value pairs which can be provided as a map or a struct.
 func Eval(boolExp string, symbols any) (bool, error) {
-	b, err := evaluateBoolExp(boolExp, flattenSymbolsMap(symbols))
+	normalized, err := Normalize(symbols)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	b, err := evaluateBoolExp(boolExp, flattenSymbolsMap(normalized))
 	return b, errors.Trace(err)
 }
 
@@ -44,27 +48,36 @@ func Validate(boolExp string) (err error) {
 	return errors.Trace(err)
 }
 
-// flattenSymbolsMap flattens the symbols map into a shallow dot-notated map,
-// while normalizing all arrays to []any and all maps to map[string]any.
-func flattenSymbolsMap(symbols any) map[string]any {
-	// Normalize all arrays to []any, all maps to map[string]any, and all numbers to int64 (an integer
-	// literal) or float64 (anything else). The decoder reads numbers exactly (UseNumber) rather than
-	// through the default float64, which holds integers only up to 2^53: a 64-bit identifier decoded as
-	// a float64 collapses onto its neighbors, so two DIFFERENT ids would compare equal.
+// Normalize decodes symbols into the map[string]any shape Eval evaluates against: numbers keep their
+// exact integer value where possible instead of always becoming a float64, and arrays and maps normalize
+// to []any and map[string]any. It is a no-op - returns symbols unchanged - when symbols is already in
+// this shape.
+//
+// Eval calls Normalize on every call, so passing it an already-normalized map skips the normalization
+// there too. A caller evaluating several expressions against one symbol set can call Normalize once and
+// reuse the result across every Eval call, paying the decode cost once instead of once per call.
+func Normalize(symbols any) (map[string]any, error) {
+	if m, ok := symbols.(map[string]any); ok && isNormalized(m) {
+		return m, nil
+	}
+	// UseNumber avoids the default float64 decode, which loses precision above 2^53 and would collapse
+	// two different 64-bit ids onto the same value.
 	j, err := json.Marshal(symbols)
 	if err != nil {
-		return nil
+		return nil, errors.Trace(err)
 	}
 	dec := json.NewDecoder(bytes.NewReader(j))
 	dec.UseNumber()
 	var mappedSymbols map[string]any
-	err = dec.Decode(&mappedSymbols)
-	if err != nil {
-		return nil
+	if err := dec.Decode(&mappedSymbols); err != nil {
+		return nil, errors.Trace(err)
 	}
 	normalizeNumbers(mappedSymbols)
+	return mappedSymbols, nil
+}
 
-	// Flatten the symbols into a shallow dot-notated map
+// flattenSymbolsMap flattens an already-normalized symbols map into a shallow dot-notated map.
+func flattenSymbolsMap(mappedSymbols map[string]any) map[string]any {
 	flattenedSymbols := map[string]any{}
 	var flatten func(obj map[string]any, prefix string)
 	flatten = func(obj map[string]any, prefix string) {
@@ -84,6 +97,31 @@ func flattenSymbolsMap(symbols any) map[string]any {
 	}
 	flatten(mappedSymbols, "")
 	return flattenedSymbols
+}
+
+// isNormalized reports whether v is already in the shape Normalize would produce, so Normalize can skip
+// re-marshaling and re-decoding it.
+func isNormalized(v any) bool {
+	switch vv := v.(type) {
+	case nil, bool, string, int64, float64, json.Number:
+		return true
+	case map[string]any:
+		for _, e := range vv {
+			if !isNormalized(e) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		for _, e := range vv {
+			if !isNormalized(e) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // normalizeNumbers replaces every json.Number in a decoded tree with an int64 (an integer literal that
